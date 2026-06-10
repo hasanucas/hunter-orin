@@ -166,3 +166,10 @@ hunter-orin/
 | OSD modu titriyor | (çözüldü — runtracker sadece autopilot heartbeat'i okur) |
 | Manuele dönüş yavaş | `RC_OVERRIDE_TIME=0.3` yazıldı mı + release `0` mı |
 | RC_OVERRIDE etkisiz | `SYSID_MYGCS=255` mi (controller_orin 255'ten gönderir) |
+
+## Troubleshooting: MK15'te 3-4 sn video donmasi
+Kok neden (10 Haz 2026'da kapatildi): Orin RTL8111 <-> SIYI VTX arasi EEE/802.3az
+uyumsuzlugu eno1'de link flap yaratiyor (her flap = 2-4 sn karanlik).
+Teshis: `cat /sys/class/net/eno1/carrier_changes` artisi + `journalctl -k | grep eno1`.
+Cozum: setup_orin.sh dispatcher kurar; dogrulama: `sudo ethtool --show-eee eno1` -> disabled.
+Bitrate tavani ~2500 kbps (SIYI paylasimli bant; 5k+ linki bogar).

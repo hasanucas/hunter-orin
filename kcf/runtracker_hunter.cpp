@@ -1,29 +1,5 @@
 // =====================================================================
-// 10 HAZIRAN — EEE-SONRASI RTSP OPTIMIZASYONU (temel: runtracker.cpp guncel)
-//  KOK NEDEN KAPANDI: 3-4 sn'lik donmalar Orin RTL8111 <-> SIYI VTX PHY
-//  arasindaki EEE/802.3az uyumsuzlugunun link flap'iydi (A/B/A testiyle
-//  kanitlandi: EEE off -> 0 flap, on -> 30 sn'de flap, off -> 0 flap).
-//  Kalici cozum OS tarafinda: ethtool --set-eee eno1 eee off
-//  (NetworkManager dispatcher: /etc/NetworkManager/dispatcher.d/99-eno1-eee-off)
-//
-//  BU DOSYADAKI DEGISIKLIKLER (kod sagligi, tek tek geri alinabilir):
-//  [1] OLU TOKEN TEMIZLIGI: profile/level/nal-hrd/min-keyint/weightp
-//      x264enc'te PROPERTY DEGIL (gst-inspect ile dogrulandi). gst_parse_launch
-//      sessizce yutuyordu, gst-launch ayni stringi reddediyor. Baseline profil
-//      zaten CAPS ile zorlaniyor -> DAVRANIS DEGISIKLIGI YOK, string artik durust.
-//  [2] MONOTONIK PTS: nominal (g_timestamp += 1/fps) sayac yerine
-//      CLOCK_MONOTONIC tabanli gercek zaman. Nominal sayac gercek kare hizindan
-//      saptikca RTP <-> RTCP SR eslesmesi kayiyordu (uzun oturumda client
-//      resync/donma riski). do-timestamp=false KORUNDU (cift-damga yok).
-//  [3] media_configure: bayat appsrc referansi tazelenir (erken-return kalkti),
-//      gst_rtsp_media_get_element ref sizintisi kapatildi, PTS tabani sifirlanir.
-//
-//  BILEREK DEGISMEYENLER: GOP=fps/2, vbv=100ms, h264parse config-interval=-1,
-//  rtph264pay config-interval=1 (-1 = YESIL EKRAN, sahada 2x dogrulandi),
-//  mtu=1200, cikis queue=5 (leaky yok), appsrc max-bytes=0, giris pipeline'i.
-// =====================================================================
-// =====================================================================
-// hasaaaaan runtracker.cpp — ORCUS gercek donanim surumu
+// runtracker.cpp — HUNTER gercek donanim surumu
 // DEGISIKLIKLER (mavlink-router mimarisi):
 //   1) MAVLink kaynagi SERI -> UDP (mavlink-router endpoint, default 14550)
 //      --serial hala calisir ama router KAPALIYKEN (dogrudan seri).
@@ -102,7 +78,7 @@ static GMainLoop *g_main_loop = nullptr;
 static std::thread g_gstThread;
 static std::mutex g_gstMutex;
 static std::atomic<bool> g_gstRunning{false};
-static gint64       g_pts_base_us = -1;   // monotonik PTS tabani (us); ilk frame'de set edilir
+static GstClockTime g_timestamp = 0;
 static guint g_fps_n = 30, g_fps_d = 1;
 
 // Telemetry (OSD için basit)
@@ -499,28 +475,24 @@ static void media_configure_cb(GstRTSPMediaFactory *factory,
                                gpointer /*user_data*/)
 {
     std::lock_guard<std::mutex> lock(g_gstMutex);
-
-    // Yeni media hazirlandi. Bayat appsrc referansi varsa TAZELE.
-    // (Eski koddaki erken-return, eski media oldugunde yeni pipeline'in
-    //  appsrc'sinin hic yakalanmamasina ve kalici siyah ekrana yol acabilirdi.)
+    
+    // ✅ ÇÖZÜM: Eğer appsrc zaten varsa, yeni client paylaşacak
     if (g_appsrc) {
-        std::cout << "[RTSP] Bayat appsrc referansi birakildi (yeni prepare)\n";
-        gst_object_unref(g_appsrc);
-        g_appsrc = nullptr;
+        std::cout << "[RTSP] ✓ Yeni client bağlandı, mevcut stream paylaşılıyor\n";
+        return;
     }
-
+    
     GstElement *pipeline = gst_rtsp_media_get_element(media);
     GstElement *appsrc = gst_bin_get_by_name_recurse_up(
         GST_BIN(pipeline), "mysrc");
-    gst_object_unref(pipeline);   // get_element ref dondurur; sizinti kapatildi
-
-    g_appsrc = appsrc;            // bin ref'i bizde kalir
-    g_pts_base_us = -1;           // PTS bu pipeline icin sifirdan baslar
-
-    // Media reusable: ayni pipeline tum clientlar icin
+    
+    g_appsrc = appsrc;
+    g_timestamp = 0;
+    
+    // ✅ Media'yı reusable yap - aynı pipeline tüm clientlar için
     gst_rtsp_media_set_reusable(media, TRUE);
-
-    std::cout << "[RTSP] Pipeline hazir, appsrc baglandi\n";
+    
+    std::cout << "[RTSP] ✓ Pipeline ilk kez oluşturuldu\n";
 }
 
 static void media_unprepared_cb(GstRTSPMedia *media, gpointer /*user_data*/)
@@ -554,7 +526,7 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
     launch
         // ===== APPsrc: KCF'ten gelen BGR frame'ler =====
         << "appsrc name=mysrc is-live=true block=false format=time "
-        << "do-timestamp=false max-bytes=0 "
+        << "do-timestamp=true max-bytes=0 "
         << "caps=video/x-raw,format=BGR,width=" << width
         << ",height=" << height
         << ",framerate=" << fps << "/1 "
@@ -563,31 +535,33 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
         << "! videoconvert "
         << "! video/x-raw,format=I420 "
 
-        // ===== x264enc: dusuk gecikme, CBR =====
-        // 10-Haz audit (gst-inspect dogrulamali): profile/level/nal-hrd/
-        // min-keyint/weightp x264enc PROPERTY DEGIL; gst_parse_launch bunlari
-        // sessizce yutuyordu. Baseline profili asagidaki CAPS satiri zorluyor.
-        // Gercek CBR = pass=cbr + vbv-buf-capacity. x264 ozel ayar gerekirse:
-        // option-string="min-keyint=15:nal-hrd=cbr"
+        // ===== x264enc: dÃ¼ÅŸÃ¼k gecikme + baseline profil =====
         << "! x264enc "
 
-        // Performans / dusuk gecikme
+        // Profil
+        << "profile=baseline "
+        << "level=3.1 "
+
+        // Performans / dÃ¼ÅŸÃ¼k gecikme
         << "tune=zerolatency "
         << "speed-preset=ultrafast "
 
         // CBR
+        << "nal-hrd=cbr "
         << "pass=cbr "
         << "bitrate=" << bitrateKbps << " "
-        << "vbv-buf-capacity=100 "
+        << "vbv-buf-capacity=" << bitrateKbps << " "
 
-        // Keyframe araligi (fps/2 ~= 0.5 sn toparlanma)
-        << "key-int-max=" << (fps/2) << " "
+        // Keyframe aralÄ±ÄŸÄ± (fps ile aynÄ±)
+        << "key-int-max=" << fps << " "
+        << "min-keyint="   << fps << " "
 
         // Baseline gereksinimleri
         << "bframes=0 "
         << "cabac=0 "
         << "dct8x8=0 "
         << "ref=1 "
+        << "weightp=0 "
 
         // Multi-thread
         << "threads=4 "
@@ -601,14 +575,14 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
         << "! video/x-h264,profile=baseline,stream-format=avc,alignment=au "
 
         // ===== h264parse: SPS/PPS =====
-        << "! h264parse config-interval=-1 "
+        << "! h264parse config-interval=1 "
 
         // ===== KÃ¼Ã§Ã¼k queue: donma yerine frame drop =====
         << "! queue "
-        << "max-size-buffers=5 "
+        << "max-size-buffers=1 "
         << "max-size-bytes=0 "
         << "max-size-time=0 "
-        //<< "leaky=2 "
+        << "leaky=2 "
 
         // ===== RTP payload (DÄ°KKAT: name=pay0) =====
         << "! rtph264pay name=pay0 "
@@ -675,17 +649,11 @@ void rtspPushFrame(const cv::Mat &frameBGR)
     std::memcpy(map.data, bgr.data, size);
     gst_buffer_unmap(buffer, &map);
 
-    // Monotonik saat bazli PTS: gercek gelis zamani (nominal 1/fps sayaci degil).
-    // RTP zamani ile RTCP SR duvar saati ayni hizda akar -> uzun oturumda
-    // clock-skew kaynakli client resync/donma riski kalkar.
-    // do-timestamp=false korunuyor: damga SADECE burada basiliyor (cift-damga yok).
-    gint64 now_us = g_get_monotonic_time();
-    if (g_pts_base_us < 0) g_pts_base_us = now_us;
-    GstClockTime pts = (GstClockTime)(now_us - g_pts_base_us) * 1000ull;
-
-    GST_BUFFER_PTS(buffer)      = pts;
-    GST_BUFFER_DTS(buffer)      = pts;   // bframes=0 -> DTS=PTS guvenli
-    GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale_int(GST_SECOND, 1, g_fps_n);
+    GstClockTime duration = gst_util_uint64_scale_int(GST_SECOND, 1, g_fps_n);
+    GST_BUFFER_PTS(buffer) = g_timestamp;
+    GST_BUFFER_DTS(buffer) = g_timestamp;
+    GST_BUFFER_DURATION(buffer) = duration;
+    g_timestamp += duration;
 
     GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(g_appsrc), buffer);
     if (ret != GST_FLOW_OK) {
@@ -736,7 +704,6 @@ int main(int argc, char** argv)
     // output resolution ayarlarÄ±
     int outWidth  = 1280;  // default
     int outHeight = 720;   // default
-    int outBitrateKbps = 1700;  // default (--bitrate ile degistir)
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--rtsp") && i+1 < argc) {
@@ -759,13 +726,11 @@ int main(int argc, char** argv)
             outWidth = std::stoi(argv[++i]);
         } else if (!strcmp(argv[i], "--height") && i+1 < argc) {
             outHeight = std::stoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--bitrate") && i+1 < argc) {
-            outBitrateKbps = std::stoi(argv[++i]);
         } else if (!strcmp(argv[i], "--help")) {
             std::cout <<
                 "Usage: " << argv[0]
                 << " [--rtsp URL] [--mavlink-udp HOST:PORT] [--frame-port N]\n"
-                << "          [--hfov DEG] [--vfov DEG] [--width W] [--height H] [--bitrate KBPS]\n"
+                << "          [--hfov DEG] [--vfov DEG] [--width W] [--height H]\n"
                 << "          [--serial DEV --baud BPS]  (router YOKKEN dogrudan seri)\n"
                 "Example (mavlink-router ile):\n"
                 "  " << argv[0]
@@ -866,6 +831,7 @@ int main(int argc, char** argv)
     std::cout << "Using size : " << outWidth << "x" << outHeight << "\n";
 
     int outFps         = 30;
+    int outBitrateKbps = 2000;
 
     if (!initRtspServer(outWidth, outHeight, outFps, outBitrateKbps)) {
         std::cerr << "RTSP server Ã§Ä±kÄ±ÅŸÄ± yok.\n";

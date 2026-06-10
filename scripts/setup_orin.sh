@@ -76,3 +76,7 @@ echo "   2) FC parametreleri (README — RC_OVERRIDE_TIME=0.3, SYSID_MYGCS=255)"
 echo "   3) cd kcf && mkdir -p build && cd build && cmake .. && make kcfTracker -j4"
 echo "   4) ./scripts/run_router.sh  +  run_tracker.sh  +  run_brain.sh"
 echo "=========================================="
+
+# --- EEE fix: RTL8111 <-> SIYI VTX link flap (video donmasinin kok nedeni) ---
+sudo install -m 755 "$(dirname "$0")/../config/99-eno1-eee-off" /etc/NetworkManager/dispatcher.d/99-eno1-eee-off
+sudo ethtool --set-eee eno1 eee off || true
