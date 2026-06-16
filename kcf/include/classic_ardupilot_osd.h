@@ -101,7 +101,8 @@ public:
         int h = frame.rows;
         
         // Telemetri bilgileri
-        drawTopLeft(frame, 10, 25, telem);
+        // [10 Haz] Sol-ust blok (RSSI + uydu sayisi) kaldirildi - istege gore
+        // drawTopLeft(frame, 10, 25, telem);
         drawTopRight(frame, w - 100, 25, telem);
         drawTopCenter(frame, w / 2, 25, telem);
         
@@ -114,8 +115,8 @@ public:
         // ROLL INDICATOR
         drawRollIndicator(frame, w / 2, 100, telem);
         
-        // ALT
-        drawBottom(frame, 10, h - 80, telem);
+        // [10 Haz] Sol-alt blok (CUAV_V5P + LAT/LON + voltaj + %) tamamen kaldirildi
+        // drawBottom(frame, 10, h - 80, telem);
         
         // MERKEZ NOKTA
         drawCenterDot(frame, w / 2, h / 2);
@@ -153,12 +154,46 @@ private:
         drawOSDText(frame, ss.str(), x, y + spacing);
     }
     
+    // Sinyal sembolu: artan yukseklikte 4 cubuk (golge + beyaz)
+    void drawSignalIcon(cv::Mat& frame, int x, int y_baseline) {
+        const int bw = 4, gap = 3;          // cubuk genisligi / aralik
+        const int heights[4] = {6, 11, 16, 21};
+        for (int i = 0; i < 4; ++i) {
+            int bx = x + i * (bw + gap);
+            int top = y_baseline - heights[i];
+            // golge
+            cv::rectangle(frame, cv::Point(bx + 1, top + 1),
+                          cv::Point(bx + bw + 1, y_baseline + 1),
+                          color_shadow, cv::FILLED);
+            // cubuk
+            cv::rectangle(frame, cv::Point(bx, top),
+                          cv::Point(bx + bw, y_baseline),
+                          color_text, cv::FILLED);
+        }
+    }
+
     void drawTopRight(cv::Mat& frame, int x, int y, const TelemetryData& telem) {
         std::ostringstream ss;
+
+        // 1) ARM / DARM
         drawOSDText(frame, telem.armed ? "ARM" : "DARM", x, y);
-        
+
+        // 2) Irtifa (bagil)
         ss << std::fixed << std::setprecision(0) << telem.altitude_rel << "m";
         drawOSDText(frame, ss.str(), x, y + spacing);
+
+        // 3) RSSI (sinyal gucu) + sinyal sembolu
+        //    Deger RC_CHANNELS_RAW.rssi'den gelir (cihaz-bagimli olcek, 0-254;
+        //    255 = gecersiz). FC RC kaynagi raporlamiyorsa 0/255 kalabilir.
+        drawSignalIcon(frame, x, y + spacing * 2);
+        ss.str("");
+        ss << telem.rssi;
+        drawOSDText(frame, ss.str(), x + 35, y + spacing * 2);   // sembolun sagina
+
+        // 4) Batarya voltaji (sol-alttan tasindi)
+        ss.str("");
+        ss << std::fixed << std::setprecision(1) << telem.battery_voltage << "V";
+        drawOSDText(frame, ss.str(), x, y + spacing * 3);
     }
     
     void drawTopCenter(cv::Mat& frame, int cx, int y, const TelemetryData& telem) {
@@ -283,7 +318,7 @@ private:
         
         // Mevcut derece (merkez altında)
         std::ostringstream ss;
-        ss << std::fixed << std::setprecision(0) << heading_deg << "°";
+        ss << std::fixed << std::setprecision(0) << heading_deg;  // [10 Haz] derece sembolu kaldirildi (Hershey ASCII -> "??" basiyordu)
         drawOSDText(frame, ss.str(), cx, y + 30, true);
     }
     
@@ -292,7 +327,7 @@ private:
         float roll_deg = telem.roll * 180.0f / M_PI;
         float pitch_deg = telem.pitch * 180.0f / M_PI;
         
-        int pitch_offset = static_cast<int>(pitch_deg * 3.0f);
+        int pitch_offset = static_cast<int>(pitch_deg * -3.0f);  // [10 Haz] isaret terslendi (pitch yonu duzeltmesi)
         
         float cos_r = std::cos(roll_deg * M_PI / 180.0f);
         float sin_r = std::sin(roll_deg * M_PI / 180.0f);

@@ -78,6 +78,14 @@ AUTO_PITCH_DIR    = -1   # SİM'de ters çıkmıştı — gerçek HW'de TEYİT E
 AUTO_THROTTLE_DIR = +1
 AUTO_YAW_DIR      = +1
 
+# --rev-* (toggle) ve --gain-* (carpan) ile runtime'da set edilir (main'de).
+# dir: AUTO_*_DIR taban * (-1 eger --rev verildiyse).  gain: merkez 1500'den
+# SAPMAYI carpar (A-yaklasimi). Sira: action -> *dir -> *gain -> +1500 -> clamp.
+# Tek kaynak: hem canli override (send_rc_override) hem loglar bunu kullanir.
+AXIS_DIR  = {'roll': AUTO_ROLL_DIR, 'pitch': AUTO_PITCH_DIR,
+             'throttle': AUTO_THROTTLE_DIR, 'yaw': AUTO_YAW_DIR}
+AXIS_GAIN = {'roll': 1.0, 'pitch': 1.0, 'throttle': 1.0, 'yaw': 1.0}
+
 
 # ============================================================================
 # YARDIMCI FONKSİYONLAR
@@ -99,6 +107,17 @@ def action_to_pwm(action_val):
     """mpc_teacher action (-1..+1) → RC PWM (1000-2000). camera_bridge ile aynı formül."""
     val = max(-1.0, min(1.0, float(action_val)))
     pwm = int(val * 500.0 + 1500.0)
+    return max(1000, min(2000, pwm))
+
+
+def axis_to_pwm(axis, action_val):
+    """TEK PWM kaynagi: action -> yon(dir) -> gain(sapma carpani) -> PWM -> clamp.
+    Gain merkez 1500'den sapmayi buyutur (A-yaklasimi): orn gain=1.2 => %20 fazla
+    kumanda. Clamp gain tasmasini guvene alir (>2000/<1000 kesilir).
+    Hem canli RC_OVERRIDE hem loglanan PWM ayni bu fonksiyondan gecer."""
+    v = AXIS_DIR[axis] * AXIS_GAIN[axis] * float(action_val)
+    v = max(-1.0, min(1.0, v))
+    pwm = int(v * 500.0 + 1500.0)
     return max(1000, min(2000, pwm))
 
 
@@ -449,10 +468,10 @@ class FCConnection:
         """action (-1..+1) → RC_OVERRIDE PWM. AUTO_*_DIR uygulanır. CH1-4 override, gerisi RC."""
         if self.conn is None:
             return
-        rc_roll     = action_to_pwm(AUTO_ROLL_DIR     * roll)
-        rc_pitch    = action_to_pwm(AUTO_PITCH_DIR    * pitch)
-        rc_throttle = action_to_pwm(AUTO_THROTTLE_DIR * throttle)
-        rc_yaw      = action_to_pwm(AUTO_YAW_DIR      * yaw)
+        rc_roll     = axis_to_pwm('roll',     roll)
+        rc_pitch    = axis_to_pwm('pitch',    pitch)
+        rc_throttle = axis_to_pwm('throttle', throttle)
+        rc_yaw      = axis_to_pwm('yaw',      yaw)
         self.conn.mav.rc_channels_override_send(
             self.target_sys, self.target_comp,
             rc_roll, rc_pitch, rc_throttle, rc_yaw,
@@ -499,12 +518,37 @@ def main():
                         help="FC'ye bağlanma (sadece FRAME testi için)")
     parser.add_argument('--log', default=None,
                         help="Flight log CSV (verilmezse otomatik tarih-saat)")
+    # --- Eksen yonu (toggle): bayrak verilirse o eksen TERSLENIR ---
+    parser.add_argument('--rev-roll',     action='store_true', help="roll eksenini tersle")
+    parser.add_argument('--rev-pitch',    action='store_true', help="pitch eksenini tersle")
+    parser.add_argument('--rev-throttle', action='store_true', help="throttle eksenini tersle")
+    parser.add_argument('--rev-yaw',      action='store_true', help="yaw eksenini tersle")
+    # --- Eksen gain (carpan): merkez 1500'den sapmayi carpar (A-yaklasimi) ---
+    parser.add_argument('--gain-roll',     type=float, default=1.0, help="roll kumanda carpani (1.2 = %20 fazla)")
+    parser.add_argument('--gain-pitch',    type=float, default=1.0, help="pitch kumanda carpani")
+    parser.add_argument('--gain-throttle', type=float, default=1.0, help="throttle kumanda carpani")
+    parser.add_argument('--gain-yaw',      type=float, default=1.0, help="yaw kumanda carpani")
     args = parser.parse_args()
+
+    # rev/gain'i global eksen tablolarina uygula (taban dir * -1 eger rev verildiyse)
+    if args.rev_roll:     AXIS_DIR['roll']     *= -1
+    if args.rev_pitch:    AXIS_DIR['pitch']    *= -1
+    if args.rev_throttle: AXIS_DIR['throttle'] *= -1
+    if args.rev_yaw:      AXIS_DIR['yaw']      *= -1
+    AXIS_GAIN['roll']     = args.gain_roll
+    AXIS_GAIN['pitch']    = args.gain_pitch
+    AXIS_GAIN['throttle'] = args.gain_throttle
+    AXIS_GAIN['yaw']      = args.gain_yaw
 
     dry_run = not args.enable_override
 
     print("=" * 70)
     print(" controller_orin.py — Gerçek Donanım Beyni")
+    print("=" * 70)
+    # Eksen yonu + gain ozeti (kod baslatinca ne uygulandigi net gorunsun)
+    for _ax in ('roll', 'pitch', 'throttle', 'yaw'):
+        _rev = " [REV]" if AXIS_DIR[_ax] != {'roll':+1,'pitch':-1,'throttle':+1,'yaw':+1}[_ax] else ""
+        print(f" [AXIS] {_ax:<8} dir={AXIS_DIR[_ax]:+d} gain={AXIS_GAIN[_ax]:.2f}{_rev}")
     print("=" * 70)
     if dry_run:
         print(" MOD: DRY-RUN (sadece oku+logla, RC_OVERRIDE YOK) — Faz 3")
@@ -599,8 +643,8 @@ def main():
 
                 action = teacher.compute_action(obs)   # privileged YOK → GPS-free
                 last_action = action
-                pwm = (action_to_pwm(action[0]), action_to_pwm(action[1]),
-                       action_to_pwm(action[2]), action_to_pwm(action[3]))
+                pwm = (axis_to_pwm('roll', action[0]), axis_to_pwm('pitch', action[1]),
+                       axis_to_pwm('throttle', action[2]), axis_to_pwm('yaw', action[3]))
 
                 if not dry_run and fc is not None:
                     fc.send_rc_override(action[0], action[1], action[2], action[3])
@@ -643,8 +687,8 @@ def main():
                       f"r={fc.roll_deg if fc else 0:+.1f} p={fc.pitch_deg if fc else 0:+.1f}")
                 if state.mode == 'autonomous':
                     a = last_action
-                    pr = action_to_pwm(AUTO_ROLL_DIR * a[0]); pp = action_to_pwm(AUTO_PITCH_DIR * a[1])
-                    pt = action_to_pwm(AUTO_THROTTLE_DIR * a[2]); py = action_to_pwm(AUTO_YAW_DIR * a[3])
+                    pr = axis_to_pwm('roll', a[0]); pp = axis_to_pwm('pitch', a[1])
+                    pt = axis_to_pwm('throttle', a[2]); py = axis_to_pwm('yaw', a[3])
                     arrow = "→ PWM" if not dry_run else "→ (DRY, gönderilmedi) PWM"
                     print(f"             └─ ACTION r={a[0]:+.3f} p={a[1]:+.3f} t={a[2]:+.3f} y={a[3]:+.3f} "
                           f"{arrow} [{pr},{pp},{pt},{py}] | ang_x={bbox.get('ang_x',0):+.1f} "

@@ -1,26 +1,28 @@
 // =====================================================================
-// 10 HAZIRAN — EEE-SONRASI RTSP OPTIMIZASYONU (temel: runtracker.cpp guncel)
-//  KOK NEDEN KAPANDI: 3-4 sn'lik donmalar Orin RTL8111 <-> SIYI VTX PHY
-//  arasindaki EEE/802.3az uyumsuzlugunun link flap'iydi (A/B/A testiyle
-//  kanitlandi: EEE off -> 0 flap, on -> 30 sn'de flap, off -> 0 flap).
-//  Kalici cozum OS tarafinda: ethtool --set-eee eno1 eee off
-//  (NetworkManager dispatcher: /etc/NetworkManager/dispatcher.d/99-eno1-eee-off)
+// 11 HAZIRAN — OTORITER BIRLESIK SURUM (onceki cataldan birlestirme)
+//  Bu dosya = OSD/RSSI duzenlemeleri + 10 Haziran RTSP audit'i + RECONNECT FIX.
+//  (Not: 10 Haz duzeltmeleri onceki kopyada kaybolmustu; burada geri geldi.)
 //
-//  BU DOSYADAKI DEGISIKLIKLER (kod sagligi, tek tek geri alinabilir):
-//  [1] OLU TOKEN TEMIZLIGI: profile/level/nal-hrd/min-keyint/weightp
-//      x264enc'te PROPERTY DEGIL (gst-inspect ile dogrulandi). gst_parse_launch
-//      sessizce yutuyordu, gst-launch ayni stringi reddediyor. Baseline profil
-//      zaten CAPS ile zorlaniyor -> DAVRANIS DEGISIKLIGI YOK, string artik durust.
-//  [2] MONOTONIK PTS: nominal (g_timestamp += 1/fps) sayac yerine
-//      CLOCK_MONOTONIC tabanli gercek zaman. Nominal sayac gercek kare hizindan
-//      saptikca RTP <-> RTCP SR eslesmesi kayiyordu (uzun oturumda client
-//      resync/donma riski). do-timestamp=false KORUNDU (cift-damga yok).
-//  [3] media_configure: bayat appsrc referansi tazelenir (erken-return kalkti),
-//      gst_rtsp_media_get_element ref sizintisi kapatildi, PTS tabani sifirlanir.
+//  RECONNECT FIX (container'da gst-rtsp-server uzerinde kanitlandi):
+//   SEMPTOM: QGC kapa-ac -> goruntu gelmiyor, runtracker restart gerekiyordu.
+//   KOK NEDEN: set_reusable(TRUE) + FLUSHING'de g_appsrc=null + "configure
+//   yalnizca media INSA edilirken ateslenir" uclusu. Kopusta referans silinir,
+//   yeniden baglanista reusable media configure ATESLEMEDEN canlanir,
+//   g_appsrc sonsuza dek null kalir -> kare gitmez.
+//   TEST KANITI (ayni mantigin birebir kopyasiyla):
+//     mevcut: 1.baglanti=149 veri, 2.baglanti=0  (bug uretildi)
+//     fix   : 1.baglanti=148 veri, 2.baglanti=150 (cozuldu, 3 kopusta da calisti)
+//   COZUM: reusable KALDIRILDI (her baglanti yeni construct -> configure
+//   ateslenir), configure bayat referansi TAZELER (erken-return kalkti).
+//   Ayrica: factory'de "media-unprepared" diye bir sinyal YOK (hic calismiyordu);
+//   dogru yer media'nin "unprepared" sinyali -> configure icinde baglanir.
 //
-//  BILEREK DEGISMEYENLER: GOP=fps/2, vbv=100ms, h264parse config-interval=-1,
-//  rtph264pay config-interval=1 (-1 = YESIL EKRAN, sahada 2x dogrulandi),
-//  mtu=1200, cikis queue=5 (leaky yok), appsrc max-bytes=0, giris pipeline'i.
+//  10 HAZ AUDIT (geri getirildi):
+//   [1] Olu token temizligi: profile/level/nal-hrd/min-keyint/weightp
+//       x264enc property DEGIL (gst-inspect dogrulamali; davranis ayni).
+//   [2] Monotonik PTS (RTCP clock-skew fix); do-timestamp=false korundu.
+//   [3] get_element ref sizintisi kapatildi.
+//  EEE kok neden notu icin onceki changelog'a / README'ye bak.
 // =====================================================================
 // =====================================================================
 // hasaaaaan runtracker.cpp — ORCUS gercek donanim surumu
@@ -102,7 +104,7 @@ static GMainLoop *g_main_loop = nullptr;
 static std::thread g_gstThread;
 static std::mutex g_gstMutex;
 static std::atomic<bool> g_gstRunning{false};
-static gint64       g_pts_base_us = -1;   // monotonik PTS tabani (us); ilk frame'de set edilir
+static gint64       g_pts_base_us = -1;   // monotonik PTS tabani (us)
 static guint g_fps_n = 30, g_fps_d = 1;
 
 // Telemetry (OSD için basit)
@@ -385,6 +387,11 @@ void mavlinkRcThread()
                     rc_values[5] = rc.chan6_raw;
                     rc_values[6] = rc.chan7_raw;
                     rc_values[7] = rc.chan8_raw;
+                    // [10 Haz] OSD sinyal gucu: RC_CHANNELS_RAW.rssi (cihaz-bagimli, 0-254; 255=gecersiz)
+                    {
+                        std::lock_guard<std::mutex> tlock(g_telemMutex);
+                        g_telemetry.rssi = rc.rssi;
+                    }
                 }
                 
                 // ===== BASIT TELEMETRY (OSD için) =====
@@ -494,15 +501,22 @@ void readRcControl(RcControl &ctrl)
 
 // ================= RTSP OUTPUT (GStreamer) =================
 
+static void media_unprepared_cb(GstRTSPMedia *media, gpointer /*user_data*/)
+{
+    // Son client koptugunda media unprepare olur (reusable YOK -> media yok edilir).
+    // Temizligi push'taki FLUSHING yolu yapar; yeni baglantida configure tazeler.
+    std::cout << "[RTSP] Media unprepared (son client koptu)\n";
+}
+
 static void media_configure_cb(GstRTSPMediaFactory *factory,
                                GstRTSPMedia *media,
                                gpointer /*user_data*/)
 {
     std::lock_guard<std::mutex> lock(g_gstMutex);
 
-    // Yeni media hazirlandi. Bayat appsrc referansi varsa TAZELE.
-    // (Eski koddaki erken-return, eski media oldugunde yeni pipeline'in
-    //  appsrc'sinin hic yakalanmamasina ve kalici siyah ekrana yol acabilirdi.)
+    // RECONNECT FIX: bayat appsrc referansi varsa TAZELE (erken-return YOK).
+    // Erken-return + reusable kombinasyonu, QGC kapa-ac sonrasi kalici
+    // goruntusuzluk yaratiyordu (kanit: mini_rtsp testi, 11 Haz).
     if (g_appsrc) {
         std::cout << "[RTSP] Bayat appsrc referansi birakildi (yeni prepare)\n";
         gst_object_unref(g_appsrc);
@@ -515,19 +529,18 @@ static void media_configure_cb(GstRTSPMediaFactory *factory,
     gst_object_unref(pipeline);   // get_element ref dondurur; sizinti kapatildi
 
     g_appsrc = appsrc;            // bin ref'i bizde kalir
-    g_pts_base_us = -1;           // PTS bu pipeline icin sifirdan baslar
+    g_pts_base_us = -1;           // PTS bu pipeline icin sifirdan
 
-    // Media reusable: ayni pipeline tum clientlar icin
-    gst_rtsp_media_set_reusable(media, TRUE);
+    // NOT: set_reusable(TRUE) BILEREK KALDIRILDI - reconnect fix'in cekirdegi.
+    // shared=TRUE zaten es-zamanli clientlarin TEK pipeline'i paylasmasini saglar;
+    // reusable ise kopus sonrasi yeniden kullanim demekti ve configure'un bir
+    // daha ateslenmemesine yol aciyordu.
+
+    // Dogru kopus logu: media'nin "unprepared" sinyali (factory'de boyle sinyal yok)
+    g_signal_connect(media, "unprepared",
+                     (GCallback)media_unprepared_cb, nullptr);
 
     std::cout << "[RTSP] Pipeline hazir, appsrc baglandi\n";
-}
-
-static void media_unprepared_cb(GstRTSPMedia *media, gpointer /*user_data*/)
-{
-    // ✅ SHARED pipeline kullanıldığında bu callback çalışmamalı
-    // Eğer çalışırsa bile appsrc'yi temizleme - başka clientlar hala bağlı olabilir
-    std::cout << "[RTSP] Client disconnected (pipeline shared, appsrc korunuyor)\n";
 }
 
 bool initRtspServer(int width, int height, int fps, int bitrateKbps)
@@ -567,23 +580,13 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
         // 10-Haz audit (gst-inspect dogrulamali): profile/level/nal-hrd/
         // min-keyint/weightp x264enc PROPERTY DEGIL; gst_parse_launch bunlari
         // sessizce yutuyordu. Baseline profili asagidaki CAPS satiri zorluyor.
-        // Gercek CBR = pass=cbr + vbv-buf-capacity. x264 ozel ayar gerekirse:
-        // option-string="min-keyint=15:nal-hrd=cbr"
         << "! x264enc "
-
-        // Performans / dusuk gecikme
         << "tune=zerolatency "
         << "speed-preset=ultrafast "
-
-        // CBR
         << "pass=cbr "
         << "bitrate=" << bitrateKbps << " "
         << "vbv-buf-capacity=100 "
-
-        // Keyframe araligi (fps/2 ~= 0.5 sn toparlanma)
         << "key-int-max=" << (fps/2) << " "
-
-        // Baseline gereksinimleri
         << "bframes=0 "
         << "cabac=0 "
         << "dct8x8=0 "
@@ -621,8 +624,8 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
     gst_rtsp_media_factory_set_shared(factory, TRUE);  // ✅ SHARED: Tek pipeline, tüm clientlar paylaşır
     g_signal_connect(factory, "media-configure",
                      (GCallback)media_configure_cb, nullptr);
-    g_signal_connect(factory, "media-unprepared",
-                     (GCallback)media_unprepared_cb, nullptr);
+    // [11 Haz] "media-unprepared" factory sinyali YOKTUR (hic calismiyordu);
+    // dogru baglanti configure icinde media'nin "unprepared" sinyaline yapilir.
 
     gst_rtsp_mount_points_add_factory(mounts, "/main.264", factory);
     g_object_unref(mounts);
@@ -675,10 +678,8 @@ void rtspPushFrame(const cv::Mat &frameBGR)
     std::memcpy(map.data, bgr.data, size);
     gst_buffer_unmap(buffer, &map);
 
-    // Monotonik saat bazli PTS: gercek gelis zamani (nominal 1/fps sayaci degil).
-    // RTP zamani ile RTCP SR duvar saati ayni hizda akar -> uzun oturumda
-    // clock-skew kaynakli client resync/donma riski kalkar.
-    // do-timestamp=false korunuyor: damga SADECE burada basiliyor (cift-damga yok).
+    // Monotonik saat bazli PTS (10-Haz fix): RTP zamani ile RTCP duvar saati
+    // ayni hizda akar -> uzun oturumda clock-skew kaynakli resync/donma kalkar.
     gint64 now_us = g_get_monotonic_time();
     if (g_pts_base_us < 0) g_pts_base_us = now_us;
     GstClockTime pts = (GstClockTime)(now_us - g_pts_base_us) * 1000ull;
